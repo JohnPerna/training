@@ -15,7 +15,8 @@ jobs:
     timeout-minutes: 360
     env:
       VCPKG_DISABLE_METRICS: 1
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+      VCPKG_BINARY_SOURCES: "clear"
+      VCPKG_FORCE_SYSTEM_BINARIES: 1
       COLMAP_UNDERWATER_COMMIT: "5b73ae1a61856c4e712908a353c951a1ba2bc748"
       VCPKG_BASELINE_COMMIT: "4c1734ba2a969b1e6daa0ac79bc46ead7324df90"
 
@@ -26,12 +27,17 @@ jobs:
       - name: Enable MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Export GitHub Actions cache variables for vcpkg
+      - name: Expose runner 7-Zip to pinned vcpkg
         shell: pwsh
         run: |
-          "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" >> $env:GITHUB_ENV
-          "ACTIONS_CACHE_URL=$env:ACTIONS_CACHE_URL" >> $env:GITHUB_ENV
-          "ACTIONS_RUNTIME_TOKEN=$env:ACTIONS_RUNTIME_TOKEN" >> $env:GITHUB_ENV
+          $sevenZipDir = "C:\Program Files\7-Zip"
+          $sevenZipExe = Join-Path $sevenZipDir "7z.exe"
+          if (-not (Test-Path $sevenZipExe)) {
+            throw "GitHub Windows runner no longer provides $sevenZipExe"
+          }
+          $sevenZipDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $sevenZipExe | Select-Object -First 4
+          Write-Host "Pinned vcpkg will use runner-provided system tools instead of dead historical tool-download URLs."
 
       - name: Fetch pinned COLMAP Underwater source
         shell: pwsh
@@ -60,7 +66,7 @@ jobs:
         shell: pwsh
         run: |
           # This exact vcpkg commit is the one COLMAP Underwater's own Windows
-          # Azure pipeline pins. Do not silently move this source to vcpkg HEAD.
+          # Azure pipeline pins. Do not silently move the package definitions.
           git init vcpkg
           git -C vcpkg remote add origin https://github.com/microsoft/vcpkg.git
           git -C vcpkg fetch --depth 1 origin $env:VCPKG_BASELINE_COMMIT
@@ -71,8 +77,9 @@ jobs:
       - name: Install pinned CPU headless dependencies
         shell: pwsh
         run: |
-          # This follows the upstream Windows package list, excluding Qt, CGAL,
-          # and GTest because GUI, CGAL, OpenGL, and tests are disabled here.
+          # Package definitions remain frozen to the upstream Windows baseline.
+          # VCPKG_FORCE_SYSTEM_BINARIES only avoids stale bootstrap utility URLs
+          # such as the removed 7-Zip 21.07 download.
           .\vcpkg\vcpkg.exe install `
             boost-algorithm `
             boost-filesystem `
@@ -158,9 +165,9 @@ jobs:
           @"
           CPU-only, GUI-free Windows build of MDSKiel/colmap_underwater.
           Source is pinned to the commit in UPSTREAM_COMMIT.txt.
-          Dependencies are pinned to the upstream project's own Windows vcpkg
-          baseline in VCPKG_COMMIT.txt. Qt, CUDA, CGAL, GUI, OpenGL, and tests
-          are intentionally excluded for the MP3D calibration use case.
+          Dependency package definitions are pinned to the upstream project's own
+          Windows vcpkg baseline in VCPKG_COMMIT.txt. Qt, CUDA, CGAL, GUI, OpenGL,
+          and tests are intentionally excluded for the MP3D calibration use case.
           Run VERIFY_REFRACTIVE_BUILD.cmd before use.
           "@ | Set-Content artifact\README_BUILD.txt
           @"
