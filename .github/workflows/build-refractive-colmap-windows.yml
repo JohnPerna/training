@@ -37,6 +37,21 @@ jobs:
           git rev-parse HEAD | Tee-Object -FilePath ../UPSTREAM_COMMIT.txt
           Pop-Location
 
+      - name: Patch legacy Glew package name for modern Windows CMake
+        shell: pwsh
+        run: |
+          $path = "colmap_underwater/cmake/FindDependencies.cmake"
+          $text = Get-Content $path -Raw
+          $old = 'find_package(Glew ${COLMAP_FIND_TYPE})'
+          $new = 'find_package(GLEW ${COLMAP_FIND_TYPE})'
+          if (-not $text.Contains($old)) {
+            throw "Expected legacy Glew find_package line not found; upstream changed, refusing blind patch."
+          }
+          $text = $text.Replace($old, $new)
+          Set-Content -Path $path -Value $text -NoNewline
+          Write-Host "Patched legacy find_package(Glew) to CMake/vcpkg-compatible find_package(GLEW)."
+          Select-String -Path $path -Pattern 'find_package\(GLEW'
+
       - name: Clone and bootstrap vcpkg
         shell: pwsh
         run: |
