@@ -93,22 +93,29 @@ jobs:
           git -C vcpkg checkout --detach FETCH_HEAD
           git -C vcpkg rev-parse HEAD | Tee-Object -FilePath VCPKG_COMMIT.txt
 
-          # This vcpkg revision tries to honor PKG_CONFIG, but its helper writes
-          # the path to CMake cache without FORCE. OpenBLAS can cache
-          # PKGCONFIG-NOTFOUND first, preventing the supplied runner path from
-          # replacing it and causing a fallback to a now-dead 2023 MSYS URL.
-          # Preserve all pinned package definitions; only repair this bootstrap
-          # tool-selection bug.
+          # vcpkg sanitizes the environment passed into port builds, so the
+          # working PKG_CONFIG path exported by the workflow is not visible when
+          # vcpkg_fixup_pkgconfig later includes this helper. The historical
+          # fallback package URL is now 404. Keep the pinned package definitions
+          # intact and make only this bootstrap-tool choice deterministic.
           $pkgHelper = "vcpkg/scripts/cmake/vcpkg_find_acquire_program(PKGCONFIG).cmake"
           $pkgText = Get-Content $pkgHelper -Raw
-          $pkgOld = 'set(PKGCONFIG "$ENV{PKG_CONFIG}" CACHE INTERNAL "")'
-          $pkgNew = 'set(PKGCONFIG "$ENV{PKG_CONFIG}" CACHE INTERNAL "" FORCE)'
+          $pkgOld = "set(program_name pkg-config)`nif(DEFINED ENV{PKG_CONFIG})"
+          $pkgNew = @'
+set(program_name pkg-config)
+if(CMAKE_HOST_WIN32 AND EXISTS "C:/msys64/usr/bin/pkg-config.exe")
+    set(PKGCONFIG "C:/msys64/usr/bin/pkg-config.exe" CACHE INTERNAL "" FORCE)
+    set(PKGCONFIG "${PKGCONFIG}" PARENT_SCOPE)
+    return()
+endif()
+if(DEFINED ENV{PKG_CONFIG})
+'@
           if (-not $pkgText.Contains($pkgOld)) {
-            throw "Expected legacy PKG_CONFIG cache line not found; refusing blind patch."
+            throw "Expected legacy pkg-config helper prologue not found; refusing blind patch."
           }
-          $pkgText = $pkgText.Replace($pkgOld, $pkgNew)
+          $pkgText = $pkgText.Replace($pkgOld, $pkgNew.TrimEnd("`r", "`n"))
           Set-Content -Path $pkgHelper -Value $pkgText -NoNewline
-          Write-Host "Patched legacy vcpkg helper so explicit runner PKG_CONFIG overrides stale NOTFOUND cache entries."
+          Write-Host "Patched legacy vcpkg helper to use the verified runner pkg-config path inside sanitized port builds."
 
           .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
