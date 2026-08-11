@@ -3,6 +3,8 @@ name: Build Refractive COLMAP Windows
 on:
   push:
     branches: [mp3d-refractive-colmap-build]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -84,12 +86,6 @@ jobs:
           cd /d "%~dp0"
           colmap.exe -h > colmap_help.txt 2>&1
           if errorlevel 1 exit /b 1
-          findstr /i /c:"refraction" /c:"refractive" colmap_help.txt >nul
-          if errorlevel 1 (
-            echo Basic COLMAP CLI works. Top-level help does not expose a refractive keyword; inspect command help before calibration.
-          ) else (
-            echo Refractive keyword found in CLI help.
-          )
           colmap.exe feature_extractor -h > feature_extractor_help.txt 2>&1
           findstr /i /c:"refrac" feature_extractor_help.txt >nul
           if errorlevel 1 (
