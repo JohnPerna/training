@@ -1,0 +1,121 @@
+name: Build Refractive COLMAP Windows
+
+on:
+  push:
+    branches: [mp3d-refractive-colmap-build]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      VCPKG_DISABLE_METRICS: 1
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+    steps:
+      - name: Checkout build harness
+        uses: actions/checkout@v4
+
+      - name: Enable MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Export GitHub Actions cache variables for vcpkg
+        shell: pwsh
+        run: |
+          "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" >> $env:GITHUB_ENV
+          "ACTIONS_CACHE_URL=$env:ACTIONS_CACHE_URL" >> $env:GITHUB_ENV
+          "ACTIONS_RUNTIME_TOKEN=$env:ACTIONS_RUNTIME_TOKEN" >> $env:GITHUB_ENV
+
+      - name: Clone COLMAP Underwater source
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/the-sauer/colmap_underwater.git colmap_underwater
+          Push-Location colmap_underwater
+          git rev-parse HEAD | Tee-Object -FilePath ../UPSTREAM_COMMIT.txt
+          Pop-Location
+
+      - name: Clone and bootstrap vcpkg
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Build official COLMAP dependency closure with vcpkg
+        shell: pwsh
+        run: |
+          .\vcpkg\vcpkg.exe install colmap:x64-windows --clean-after-build
+
+      - name: Configure underwater fork against vcpkg dependencies
+        shell: pwsh
+        run: |
+          cmake -S colmap_underwater -B build -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$pwd/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCUDA_ENABLED=OFF `
+            -DGUI_ENABLED=OFF `
+            -DTESTS_ENABLED=OFF
+
+      - name: Build underwater COLMAP
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target colmap --parallel 2
+
+      - name: Locate executable and assemble portable runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          $exe = Get-ChildItem -Path build -Recurse -Filter colmap.exe | Select-Object -First 1
+          if (-not $exe) { throw "Could not locate built colmap.exe" }
+          Copy-Item $exe.FullName artifact\colmap.exe
+          if (Test-Path vcpkg\installed\x64-windows\bin) {
+            Copy-Item vcpkg\installed\x64-windows\bin\*.dll artifact\ -ErrorAction SilentlyContinue
+          }
+          Copy-Item UPSTREAM_COMMIT.txt artifact\UPSTREAM_COMMIT.txt
+          @"
+          This is a CPU-only Windows build of the-sauer/colmap_underwater.
+          Built on GitHub Actions windows-2022.
+          The upstream commit is recorded in UPSTREAM_COMMIT.txt.
+          Run VERIFY_REFRACTIVE_BUILD.cmd before use.
+          "@ | Set-Content artifact\README_BUILD.txt
+          @"
+          @echo off
+          setlocal
+          cd /d "%~dp0"
+          colmap.exe -h > colmap_help.txt 2>&1
+          if errorlevel 1 exit /b 1
+          findstr /i /c:"refraction" /c:"refractive" colmap_help.txt >nul
+          if errorlevel 1 (
+            echo Basic COLMAP CLI works. Top-level help does not expose a refractive keyword; inspect command help before calibration.
+          ) else (
+            echo Refractive keyword found in CLI help.
+          )
+          colmap.exe feature_extractor -h > feature_extractor_help.txt 2>&1
+          findstr /i /c:"refrac" feature_extractor_help.txt >nul
+          if errorlevel 1 (
+            echo ERROR: feature_extractor help does not expose refractive options.
+            exit /b 2
+          )
+          echo VERIFIED: underwater/refractive feature-extractor options are present.
+          "@ | Set-Content artifact\VERIFY_REFRACTIVE_BUILD.cmd
+
+      - name: Smoke-test built executable
+        shell: pwsh
+        run: |
+          Push-Location artifact
+          .\colmap.exe -h
+          .\colmap.exe feature_extractor -h | Tee-Object -FilePath feature_extractor_help_ci.txt
+          $help = Get-Content feature_extractor_help_ci.txt -Raw
+          if ($help -notmatch '(?i)refrac') {
+            throw "Built executable does not expose refractive feature-extractor options; refusing to publish artifact."
+          }
+          Pop-Location
+
+      - name: Upload portable Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: refractive-colmap-windows-x64-cpu
+          path: artifact/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
