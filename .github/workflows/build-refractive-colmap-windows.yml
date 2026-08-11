@@ -5,6 +5,10 @@ on:
     branches: [mp3d-refractive-colmap-build]
   workflow_dispatch:
 
+concurrency:
+  group: refractive-colmap-windows-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-2022
@@ -12,6 +16,8 @@ jobs:
     env:
       VCPKG_DISABLE_METRICS: 1
       VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+      COLMAP_UNDERWATER_COMMIT: "5b73ae1a61856c4e712908a353c951a1ba2bc748"
+      VCPKG_BASELINE_COMMIT: "4c1734ba2a969b1e6daa0ac79bc46ead7324df90"
 
     steps:
       - name: Checkout build harness
@@ -27,13 +33,14 @@ jobs:
           "ACTIONS_CACHE_URL=$env:ACTIONS_CACHE_URL" >> $env:GITHUB_ENV
           "ACTIONS_RUNTIME_TOKEN=$env:ACTIONS_RUNTIME_TOKEN" >> $env:GITHUB_ENV
 
-      - name: Clone COLMAP Underwater source
+      - name: Fetch pinned COLMAP Underwater source
         shell: pwsh
         run: |
-          git clone --depth 1 https://github.com/the-sauer/colmap_underwater.git colmap_underwater
-          Push-Location colmap_underwater
-          git rev-parse HEAD | Tee-Object -FilePath ../UPSTREAM_COMMIT.txt
-          Pop-Location
+          git init colmap_underwater
+          git -C colmap_underwater remote add origin https://github.com/MDSKiel/colmap_underwater.git
+          git -C colmap_underwater fetch --depth 1 origin $env:COLMAP_UNDERWATER_COMMIT
+          git -C colmap_underwater checkout --detach FETCH_HEAD
+          git -C colmap_underwater rev-parse HEAD | Tee-Object -FilePath UPSTREAM_COMMIT.txt
 
       - name: Patch legacy Glew package name for modern Windows CMake
         shell: pwsh
@@ -48,29 +55,40 @@ jobs:
           $text = $text.Replace($old, $new)
           Set-Content -Path $path -Value $text -NoNewline
           Write-Host "Patched legacy find_package(Glew) to CMake/vcpkg-compatible find_package(GLEW)."
-          Select-String -Path $path -Pattern 'find_package\(GLEW'
 
-      - name: Clone and bootstrap vcpkg
+      - name: Fetch upstream-pinned vcpkg baseline
         shell: pwsh
         run: |
-          git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+          # This exact vcpkg commit is the one COLMAP Underwater's own Windows
+          # Azure pipeline pins. Do not silently move this source to vcpkg HEAD.
+          git init vcpkg
+          git -C vcpkg remote add origin https://github.com/microsoft/vcpkg.git
+          git -C vcpkg fetch --depth 1 origin $env:VCPKG_BASELINE_COMMIT
+          git -C vcpkg checkout --detach FETCH_HEAD
+          git -C vcpkg rev-parse HEAD | Tee-Object -FilePath VCPKG_COMMIT.txt
           .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
-      - name: Install only CPU headless dependencies
+      - name: Install pinned CPU headless dependencies
         shell: pwsh
         run: |
-          # Do NOT install the vcpkg COLMAP port here. Its default GUI feature
-          # pulls Qt, which we neither need nor want for this calibration build.
+          # This follows the upstream Windows package list, excluding Qt, CGAL,
+          # and GTest because GUI, CGAL, OpenGL, and tests are disabled here.
           .\vcpkg\vcpkg.exe install `
+            boost-algorithm `
             boost-filesystem `
             boost-graph `
+            boost-heap `
             boost-program-options `
+            boost-property-map `
+            boost-property-tree `
+            boost-regex `
             boost-system `
             eigen3 `
             freeimage `
             flann `
             lz4 `
             metis `
+            gflags `
             glog `
             sqlite3 `
             glew `
@@ -78,7 +96,7 @@ jobs:
             --triplet x64-windows `
             --clean-after-build
 
-      - name: Configure underwater fork against minimal vcpkg dependencies
+      - name: Configure underwater fork against pinned vcpkg baseline
         shell: pwsh
         run: |
           cmake -S colmap_underwater -B build -A x64 `
@@ -94,9 +112,6 @@ jobs:
       - name: Build underwater COLMAP executable
         shell: pwsh
         run: |
-          # The executable target is colmap_main; the target named colmap is an
-          # interface library in this older fork. Capture a compact error file
-          # so old-source/new-MSVC compatibility failures are directly inspectable.
           $log = "build-output.txt"
           cmake --build build --config Release --target colmap_main --parallel 2 -- /verbosity:minimal 2>&1 | Tee-Object -FilePath $log
           $code = $LASTEXITCODE
@@ -122,6 +137,8 @@ jobs:
           path: |
             build-errors.txt
             build-output.txt
+            UPSTREAM_COMMIT.txt
+            VCPKG_COMMIT.txt
           if-no-files-found: ignore
           compression-level: 6
           retention-days: 7
@@ -137,12 +154,13 @@ jobs:
             Copy-Item vcpkg\installed\x64-windows\bin\*.dll artifact\ -ErrorAction SilentlyContinue
           }
           Copy-Item UPSTREAM_COMMIT.txt artifact\UPSTREAM_COMMIT.txt
+          Copy-Item VCPKG_COMMIT.txt artifact\VCPKG_COMMIT.txt
           @"
-          This is a CPU-only, GUI-free Windows build of the-sauer/colmap_underwater.
-          Built on GitHub Actions windows-2022 with only the dependencies needed
-          by this older Refractive COLMAP fork. Qt, CUDA, CGAL, GUI, and OpenGL
-          support are intentionally excluded.
-          The upstream commit is recorded in UPSTREAM_COMMIT.txt.
+          CPU-only, GUI-free Windows build of MDSKiel/colmap_underwater.
+          Source is pinned to the commit in UPSTREAM_COMMIT.txt.
+          Dependencies are pinned to the upstream project's own Windows vcpkg
+          baseline in VCPKG_COMMIT.txt. Qt, CUDA, CGAL, GUI, OpenGL, and tests
+          are intentionally excluded for the MP3D calibration use case.
           Run VERIFY_REFRACTIVE_BUILD.cmd before use.
           "@ | Set-Content artifact\README_BUILD.txt
           @"
