@@ -101,19 +101,20 @@ jobs:
           $pkgHelper = "vcpkg/scripts/cmake/vcpkg_find_acquire_program(PKGCONFIG).cmake"
           $pkgText = Get-Content $pkgHelper -Raw
           $pkgOld = "set(program_name pkg-config)`nif(DEFINED ENV{PKG_CONFIG})"
-          $pkgNew = @'
-set(program_name pkg-config)
-if(CMAKE_HOST_WIN32 AND EXISTS "C:/msys64/usr/bin/pkg-config.exe")
-    set(PKGCONFIG "C:/msys64/usr/bin/pkg-config.exe" CACHE INTERNAL "" FORCE)
-    set(PKGCONFIG "${PKGCONFIG}" PARENT_SCOPE)
-    return()
-endif()
-if(DEFINED ENV{PKG_CONFIG})
-'@
+          $pkgNewLines = @(
+            'set(program_name pkg-config)',
+            'if(CMAKE_HOST_WIN32 AND EXISTS "C:/msys64/usr/bin/pkg-config.exe")',
+            '    set(PKGCONFIG "C:/msys64/usr/bin/pkg-config.exe" CACHE INTERNAL "" FORCE)',
+            '    set(PKGCONFIG "${PKGCONFIG}" PARENT_SCOPE)',
+            '    return()',
+            'endif()',
+            'if(DEFINED ENV{PKG_CONFIG})'
+          )
+          $pkgNew = $pkgNewLines -join "`n"
           if (-not $pkgText.Contains($pkgOld)) {
             throw "Expected legacy pkg-config helper prologue not found; refusing blind patch."
           }
-          $pkgText = $pkgText.Replace($pkgOld, $pkgNew.TrimEnd("`r", "`n"))
+          $pkgText = $pkgText.Replace($pkgOld, $pkgNew)
           Set-Content -Path $pkgHelper -Value $pkgText -NoNewline
           Write-Host "Patched legacy vcpkg helper to use the verified runner pkg-config path inside sanitized port builds."
 
