@@ -42,11 +42,6 @@ jobs:
       - name: Expose runner MSYS2 pkg-config to pinned vcpkg
         shell: pwsh
         run: |
-          # The pinned 2023 vcpkg package definitions are still the upstream
-          # baseline, but their hard-coded MSYS pkgconf archive has disappeared
-          # from every mirror. The pinned vcpkg script explicitly honors the
-          # PKG_CONFIG environment variable, so use the current runner's MSYS2
-          # pkg-config instead of downloading that vanished archive.
           $candidates = @(
             "C:\msys64\usr\bin\pkg-config.exe",
             "C:\msys64\usr\bin\pkgconf.exe"
@@ -92,21 +87,34 @@ jobs:
       - name: Fetch upstream-pinned vcpkg baseline
         shell: pwsh
         run: |
-          # This exact vcpkg commit is the one COLMAP Underwater's own Windows
-          # Azure pipeline pins. Do not silently move the package definitions.
           git init vcpkg
           git -C vcpkg remote add origin https://github.com/microsoft/vcpkg.git
           git -C vcpkg fetch --depth 1 origin $env:VCPKG_BASELINE_COMMIT
           git -C vcpkg checkout --detach FETCH_HEAD
           git -C vcpkg rev-parse HEAD | Tee-Object -FilePath VCPKG_COMMIT.txt
+
+          # This vcpkg revision tries to honor PKG_CONFIG, but its helper writes
+          # the path to CMake cache without FORCE. OpenBLAS can cache
+          # PKGCONFIG-NOTFOUND first, preventing the supplied runner path from
+          # replacing it and causing a fallback to a now-dead 2023 MSYS URL.
+          # Preserve all pinned package definitions; only repair this bootstrap
+          # tool-selection bug.
+          $pkgHelper = "vcpkg/scripts/cmake/vcpkg_find_acquire_program(PKGCONFIG).cmake"
+          $pkgText = Get-Content $pkgHelper -Raw
+          $pkgOld = 'set(PKGCONFIG "$ENV{PKG_CONFIG}" CACHE INTERNAL "")'
+          $pkgNew = 'set(PKGCONFIG "$ENV{PKG_CONFIG}" CACHE INTERNAL "" FORCE)'
+          if (-not $pkgText.Contains($pkgOld)) {
+            throw "Expected legacy PKG_CONFIG cache line not found; refusing blind patch."
+          }
+          $pkgText = $pkgText.Replace($pkgOld, $pkgNew)
+          Set-Content -Path $pkgHelper -Value $pkgText -NoNewline
+          Write-Host "Patched legacy vcpkg helper so explicit runner PKG_CONFIG overrides stale NOTFOUND cache entries."
+
           .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
       - name: Install pinned CPU headless dependencies
         shell: pwsh
         run: |
-          # Package definitions remain frozen to the upstream Windows baseline.
-          # Runner-provided utility binaries only replace stale bootstrap URLs;
-          # they do not change COLMAP/Ceres/Boost/etc. package versions.
           .\vcpkg\vcpkg.exe install `
             boost-algorithm `
             boost-filesystem `
