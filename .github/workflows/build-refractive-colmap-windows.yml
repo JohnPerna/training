@@ -3,8 +3,6 @@ name: Build Refractive COLMAP Windows
 on:
   push:
     branches: [mp3d-refractive-colmap-build]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -97,8 +95,36 @@ jobs:
         shell: pwsh
         run: |
           # The executable target is colmap_main; the target named colmap is an
-          # interface library in this older fork.
-          cmake --build build --config Release --target colmap_main --parallel 2
+          # interface library in this older fork. Capture a compact error file
+          # so old-source/new-MSVC compatibility failures are directly inspectable.
+          $log = "build-output.txt"
+          cmake --build build --config Release --target colmap_main --parallel 2 -- /verbosity:minimal 2>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $patterns = 'error C\d+|fatal error|CMake Error|MSB\d+|FAILED:|error:'
+            Select-String -Path $log -Pattern $patterns |
+              ForEach-Object { $_.Line } |
+              Select-Object -First 300 |
+              Set-Content build-errors.txt
+            if (-not (Test-Path build-errors.txt) -or (Get-Item build-errors.txt).Length -eq 0) {
+              "Build failed with exit code $code, but no standard compiler-error pattern matched. See build-output.txt." | Set-Content build-errors.txt
+            }
+            Write-Host "===== compact build errors ====="
+            Get-Content build-errors.txt
+            exit $code
+          }
+
+      - name: Upload build diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refractive-colmap-build-errors
+          path: |
+            build-errors.txt
+            build-output.txt
+          if-no-files-found: ignore
+          compression-level: 6
+          retention-days: 7
 
       - name: Locate executable and assemble portable runtime
         shell: pwsh
