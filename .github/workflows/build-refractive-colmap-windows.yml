@@ -58,12 +58,29 @@ jobs:
           git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
           .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
-      - name: Build official COLMAP dependency closure with vcpkg
+      - name: Install only CPU headless dependencies
         shell: pwsh
         run: |
-          .\vcpkg\vcpkg.exe install colmap:x64-windows --clean-after-build
+          # Do NOT install the vcpkg COLMAP port here. Its default GUI feature
+          # pulls Qt, which we neither need nor want for this calibration build.
+          .\vcpkg\vcpkg.exe install `
+            boost-filesystem `
+            boost-graph `
+            boost-program-options `
+            boost-system `
+            eigen3 `
+            freeimage `
+            flann `
+            lz4 `
+            metis `
+            glog `
+            sqlite3 `
+            glew `
+            "ceres[lapack,suitesparse]" `
+            --triplet x64-windows `
+            --clean-after-build
 
-      - name: Configure underwater fork against vcpkg dependencies
+      - name: Configure underwater fork against minimal vcpkg dependencies
         shell: pwsh
         run: |
           cmake -S colmap_underwater -B build -A x64 `
@@ -71,12 +88,17 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DCUDA_ENABLED=OFF `
             -DGUI_ENABLED=OFF `
+            -DOPENGL_ENABLED=OFF `
+            -DCGAL_ENABLED=OFF `
+            -DIPO_ENABLED=OFF `
             -DTESTS_ENABLED=OFF
 
-      - name: Build underwater COLMAP
+      - name: Build underwater COLMAP executable
         shell: pwsh
         run: |
-          cmake --build build --config Release --target colmap --parallel 2
+          # The executable target is colmap_main; the target named colmap is an
+          # interface library in this older fork.
+          cmake --build build --config Release --target colmap_main --parallel 2
 
       - name: Locate executable and assemble portable runtime
         shell: pwsh
@@ -90,8 +112,10 @@ jobs:
           }
           Copy-Item UPSTREAM_COMMIT.txt artifact\UPSTREAM_COMMIT.txt
           @"
-          This is a CPU-only Windows build of the-sauer/colmap_underwater.
-          Built on GitHub Actions windows-2022.
+          This is a CPU-only, GUI-free Windows build of the-sauer/colmap_underwater.
+          Built on GitHub Actions windows-2022 with only the dependencies needed
+          by this older Refractive COLMAP fork. Qt, CUDA, CGAL, GUI, and OpenGL
+          support are intentionally excluded.
           The upstream commit is recorded in UPSTREAM_COMMIT.txt.
           Run VERIFY_REFRACTIVE_BUILD.cmd before use.
           "@ | Set-Content artifact\README_BUILD.txt
@@ -102,12 +126,12 @@ jobs:
           colmap.exe -h > colmap_help.txt 2>&1
           if errorlevel 1 exit /b 1
           colmap.exe feature_extractor -h > feature_extractor_help.txt 2>&1
-          findstr /i /c:"refrac" feature_extractor_help.txt >nul
+          findstr /i /c:"camera_refrac_model" feature_extractor_help.txt >nul
           if errorlevel 1 (
-            echo ERROR: feature_extractor help does not expose refractive options.
+            echo ERROR: feature_extractor help does not expose camera_refrac_model.
             exit /b 2
           )
-          echo VERIFIED: underwater/refractive feature-extractor options are present.
+          echo VERIFIED: Refractive COLMAP camera options are present.
           "@ | Set-Content artifact\VERIFY_REFRACTIVE_BUILD.cmd
 
       - name: Smoke-test built executable
@@ -117,8 +141,8 @@ jobs:
           .\colmap.exe -h
           .\colmap.exe feature_extractor -h | Tee-Object -FilePath feature_extractor_help_ci.txt
           $help = Get-Content feature_extractor_help_ci.txt -Raw
-          if ($help -notmatch '(?i)refrac') {
-            throw "Built executable does not expose refractive feature-extractor options; refusing to publish artifact."
+          if ($help -notmatch '(?i)camera_refrac_model') {
+            throw "Built executable does not expose ImageReader.camera_refrac_model; refusing to publish artifact."
           }
           Pop-Location
 
