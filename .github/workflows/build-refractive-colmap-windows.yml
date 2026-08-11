@@ -37,7 +37,34 @@ jobs:
           }
           $sevenZipDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & $sevenZipExe | Select-Object -First 4
-          Write-Host "Pinned vcpkg will use runner-provided system tools instead of dead historical tool-download URLs."
+          Write-Host "Pinned vcpkg will use runner-provided 7-Zip instead of dead historical tool-download URLs."
+
+      - name: Expose runner MSYS2 pkg-config to pinned vcpkg
+        shell: pwsh
+        run: |
+          # The pinned 2023 vcpkg package definitions are still the upstream
+          # baseline, but their hard-coded MSYS pkgconf archive has disappeared
+          # from every mirror. The pinned vcpkg script explicitly honors the
+          # PKG_CONFIG environment variable, so use the current runner's MSYS2
+          # pkg-config instead of downloading that vanished archive.
+          $candidates = @(
+            "C:\msys64\usr\bin\pkg-config.exe",
+            "C:\msys64\usr\bin\pkgconf.exe"
+          )
+          $pkgConfig = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $pkgConfig) {
+            Write-Host "pkg-config not preinstalled in runner MSYS2; installing current pkgconf package."
+            & "C:\msys64\usr\bin\bash.exe" -lc "pacman -Sy --needed --noconfirm pkgconf"
+            if ($LASTEXITCODE -ne 0) { throw "MSYS2 pkgconf installation failed with exit code $LASTEXITCODE" }
+            $pkgConfig = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $pkgConfig) {
+            throw "Could not locate pkg-config/pkgconf on the GitHub Windows runner."
+          }
+          "PKG_CONFIG=$pkgConfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & $pkgConfig --version
+          if ($LASTEXITCODE -ne 0) { throw "Runner pkg-config failed its version check." }
+          Write-Host "Pinned vcpkg will use runner pkg-config at $pkgConfig."
 
       - name: Fetch pinned COLMAP Underwater source
         shell: pwsh
@@ -78,8 +105,8 @@ jobs:
         shell: pwsh
         run: |
           # Package definitions remain frozen to the upstream Windows baseline.
-          # VCPKG_FORCE_SYSTEM_BINARIES only avoids stale bootstrap utility URLs
-          # such as the removed 7-Zip 21.07 download.
+          # Runner-provided utility binaries only replace stale bootstrap URLs;
+          # they do not change COLMAP/Ceres/Boost/etc. package versions.
           .\vcpkg\vcpkg.exe install `
             boost-algorithm `
             boost-filesystem `
