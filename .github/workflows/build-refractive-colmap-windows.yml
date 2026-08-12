@@ -19,6 +19,7 @@ jobs:
       VCPKG_FORCE_SYSTEM_BINARIES: 1
       COLMAP_UNDERWATER_COMMIT: "5b73ae1a61856c4e712908a353c951a1ba2bc748"
       VCPKG_BASELINE_COMMIT: "4c1734ba2a969b1e6daa0ac79bc46ead7324df90"
+      VCPKG_CACHE_KEY: "refractive-colmap-vcpkg-win64-4c1734ba-deps-v2"
 
     steps:
       - name: Checkout build harness
@@ -39,31 +40,41 @@ jobs:
           & $sevenZipExe | Select-Object -First 4
           Write-Host "Pinned vcpkg will use runner-provided 7-Zip instead of dead historical tool-download URLs."
 
-      - name: Install native MinGW pkg-config and preflight vcpkg path semantics
+      - name: Install current MinGW build tools and preflight compatibility
         shell: pwsh
         run: |
           $bash = "C:\msys64\usr\bin\bash.exe"
+          $mingwBin = "C:\msys64\mingw64\bin"
           if (-not (Test-Path $bash)) {
             throw "GitHub Windows runner no longer provides MSYS2 at $bash"
           }
 
-          & $bash -lc "pacman -Sy --needed --noconfirm mingw-w64-x86_64-pkgconf"
+          # The pinned 2023 vcpkg snapshot references MSYS2 package revisions
+          # that have since been removed from the mirrors. Install the current
+          # equivalents from the runner's maintained MSYS2 installation.
+          & $bash -lc "pacman -Sy --needed --noconfirm mingw-w64-x86_64-pkgconf mingw-w64-x86_64-gcc-fortran"
           if ($LASTEXITCODE -ne 0) {
-            throw "Could not install current MSYS2 native MinGW pkgconf."
+            throw "Could not install current MSYS2 MinGW pkgconf/gfortran."
           }
 
-          $pkgConfig = "C:\msys64\mingw64\bin\pkg-config.exe"
-          if (-not (Test-Path $pkgConfig)) {
-            throw "Native MinGW pkg-config was not installed at $pkgConfig"
+          $pkgConfig = Join-Path $mingwBin "pkg-config.exe"
+          $gfortran = Join-Path $mingwBin "gfortran.exe"
+          foreach ($tool in @($pkgConfig, $gfortran)) {
+            if (-not (Test-Path $tool)) { throw "Expected MinGW tool is missing: $tool" }
           }
+
+          # Make native MinGW tools visible to vcpkg's CMake compiler discovery.
+          $env:PATH = "$mingwBin;$env:PATH"
+          $mingwBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "PKG_CONFIG=$pkgConfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
           & $pkgConfig --version
-          if ($LASTEXITCODE -ne 0) {
-            throw "Native MinGW pkg-config failed its version check."
-          }
+          if ($LASTEXITCODE -ne 0) { throw "Native MinGW pkg-config failed its version check." }
+          & $gfortran --version | Select-Object -First 1
+          if ($LASTEXITCODE -ne 0) { throw "Native MinGW gfortran failed its version check." }
 
-          # vcpkg_fixup_pkgconfig passes native Windows paths separated by
-          # semicolons. Prove this exact executable can resolve that format
-          # before spending minutes compiling OpenBLAS.
+          # Prove pkg-config accepts the exact native Windows semicolon path
+          # convention used by vcpkg_fixup_pkgconfig.
           $probe1 = Join-Path $pwd "pkgconf_probe_empty"
           $probe2 = Join-Path $pwd "pkgconf_probe_hit"
           New-Item -ItemType Directory -Force $probe1, $probe2 | Out-Null
@@ -78,15 +89,32 @@ jobs:
           $oldPkgPath = $env:PKG_CONFIG_PATH
           $env:PKG_CONFIG_PATH = "$probe1;$probe2"
           & $pkgConfig --exists mp3d-pkgconf-probe
-          $probeCode = $LASTEXITCODE
+          $pkgProbeCode = $LASTEXITCODE
           $env:PKG_CONFIG_PATH = $oldPkgPath
           Remove-Item -Recurse -Force $probe1, $probe2
-          if ($probeCode -ne 0) {
+          if ($pkgProbeCode -ne 0) {
             throw "Native MinGW pkg-config cannot resolve vcpkg-style Windows semicolon PKG_CONFIG_PATH."
           }
 
-          "PKG_CONFIG=$pkgConfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "Verified native MinGW pkg-config with vcpkg-style Windows PKG_CONFIG_PATH semantics."
+          # Prove the current gfortran can compile, link, and execute a native
+          # x64 Windows program before vcpkg reaches LAPACK/SuiteSparse.
+          $fortranSource = Join-Path $pwd "gfortran_probe.f90"
+          $fortranExe = Join-Path $pwd "gfortran_probe.exe"
+          @(
+            'program mp3d_probe',
+            '  print *, "MP3D_GFORTRAN_OK"',
+            'end program mp3d_probe'
+          ) | Set-Content $fortranSource
+          & $gfortran -m64 $fortranSource -o $fortranExe
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $fortranExe)) {
+            throw "Native MinGW gfortran failed the compile/link preflight."
+          }
+          $fortranOutput = & $fortranExe 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0 -or $fortranOutput -notmatch 'MP3D_GFORTRAN_OK') {
+            throw "Native MinGW gfortran-built executable failed its runtime preflight."
+          }
+          Remove-Item -Force $fortranSource, $fortranExe
+          Write-Host "Verified native MinGW pkg-config and gfortran for pinned vcpkg."
 
       - name: Fetch pinned COLMAP Underwater source
         shell: pwsh
@@ -145,6 +173,13 @@ jobs:
 
           .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
+      - name: Restore pinned dependency tree
+        id: restore-vcpkg
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg/installed
+          key: ${{ env.VCPKG_CACHE_KEY }}
+
       - name: Install pinned CPU headless dependencies
         shell: pwsh
         run: |
@@ -170,6 +205,13 @@ jobs:
             "ceres[lapack,suitesparse]" `
             --triplet x64-windows `
             --clean-after-build
+
+      - name: Save pinned dependency tree
+        if: steps.restore-vcpkg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg/installed
+          key: ${{ env.VCPKG_CACHE_KEY }}
 
       - name: Configure underwater fork against pinned vcpkg baseline
         shell: pwsh
@@ -227,6 +269,12 @@ jobs:
           Copy-Item $exe.FullName artifact\colmap.exe
           if (Test-Path vcpkg\installed\x64-windows\bin) {
             Copy-Item vcpkg\installed\x64-windows\bin\*.dll artifact\ -ErrorAction SilentlyContinue
+          }
+          # LAPACK may have been built with the runner's external MinGW
+          # gfortran. Include its runtime DLLs if they are present.
+          foreach ($dll in @('libgfortran-5.dll','libquadmath-0.dll','libwinpthread-1.dll','libgcc_s_seh-1.dll')) {
+            $src = Join-Path 'C:\msys64\mingw64\bin' $dll
+            if (Test-Path $src) { Copy-Item $src artifact\ }
           }
           Copy-Item UPSTREAM_COMMIT.txt artifact\UPSTREAM_COMMIT.txt
           Copy-Item VCPKG_COMMIT.txt artifact\VCPKG_COMMIT.txt
