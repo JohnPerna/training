@@ -38,28 +38,21 @@ jobs:
           }
           $sevenZipDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & $sevenZipExe | Select-Object -First 4
-          Write-Host "Pinned vcpkg will use runner-provided 7-Zip instead of dead historical tool-download URLs."
 
       - name: Install current MinGW build tools and preflight compatibility
         shell: pwsh
         run: |
           $bash = "C:\msys64\usr\bin\bash.exe"
           $mingwBin = "C:\msys64\mingw64\bin"
-          if (-not (Test-Path $bash)) {
-            throw "GitHub Windows runner no longer provides MSYS2 at $bash"
-          }
-
+          if (-not (Test-Path $bash)) { throw "GitHub Windows runner no longer provides MSYS2 at $bash" }
           & $bash -lc "pacman -Sy --needed --noconfirm mingw-w64-x86_64-pkgconf mingw-w64-x86_64-gcc-fortran"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Could not install current MSYS2 MinGW pkgconf/gfortran."
-          }
+          if ($LASTEXITCODE -ne 0) { throw "Could not install current MSYS2 MinGW pkgconf/gfortran." }
 
           $pkgConfig = Join-Path $mingwBin "pkg-config.exe"
           $gfortran = Join-Path $mingwBin "gfortran.exe"
           foreach ($tool in @($pkgConfig, $gfortran)) {
             if (-not (Test-Path $tool)) { throw "Expected MinGW tool is missing: $tool" }
           }
-
           $env:PATH = "$mingwBin;$env:PATH"
           $mingwBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           "PKG_CONFIG=$pkgConfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -72,39 +65,23 @@ jobs:
           $probe1 = Join-Path $pwd "pkgconf_probe_empty"
           $probe2 = Join-Path $pwd "pkgconf_probe_hit"
           New-Item -ItemType Directory -Force $probe1, $probe2 | Out-Null
-          @(
-            'prefix=C:/mp3d-probe',
-            'Name: mp3d-pkgconf-probe',
-            'Description: vcpkg Windows path semantics probe',
-            'Version: 1.0',
-            'Libs:',
-            'Cflags:'
-          ) | Set-Content (Join-Path $probe2 "mp3d-pkgconf-probe.pc")
+          @('prefix=C:/mp3d-probe','Name: mp3d-pkgconf-probe','Description: vcpkg Windows path semantics probe','Version: 1.0','Libs:','Cflags:') |
+            Set-Content (Join-Path $probe2 "mp3d-pkgconf-probe.pc")
           $oldPkgPath = $env:PKG_CONFIG_PATH
           $env:PKG_CONFIG_PATH = "$probe1;$probe2"
           & $pkgConfig --exists mp3d-pkgconf-probe
           $pkgProbeCode = $LASTEXITCODE
           $env:PKG_CONFIG_PATH = $oldPkgPath
           Remove-Item -Recurse -Force $probe1, $probe2
-          if ($pkgProbeCode -ne 0) {
-            throw "Native MinGW pkg-config cannot resolve vcpkg-style Windows semicolon PKG_CONFIG_PATH."
-          }
+          if ($pkgProbeCode -ne 0) { throw "Native MinGW pkg-config cannot resolve vcpkg-style Windows semicolon PKG_CONFIG_PATH." }
 
           $fortranSource = Join-Path $pwd "gfortran_probe.f90"
           $fortranExe = Join-Path $pwd "gfortran_probe.exe"
-          @(
-            'program mp3d_probe',
-            '  print *, "MP3D_GFORTRAN_OK"',
-            'end program mp3d_probe'
-          ) | Set-Content $fortranSource
+          @('program mp3d_probe','  print *, "MP3D_GFORTRAN_OK"','end program mp3d_probe') | Set-Content $fortranSource
           & $gfortran -m64 $fortranSource -o $fortranExe
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $fortranExe)) {
-            throw "Native MinGW gfortran failed the compile/link preflight."
-          }
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $fortranExe)) { throw "Native MinGW gfortran failed the compile/link preflight." }
           $fortranOutput = & $fortranExe 2>&1 | Out-String
-          if ($LASTEXITCODE -ne 0 -or $fortranOutput -notmatch 'MP3D_GFORTRAN_OK') {
-            throw "Native MinGW gfortran-built executable failed its runtime preflight."
-          }
+          if ($LASTEXITCODE -ne 0 -or $fortranOutput -notmatch 'MP3D_GFORTRAN_OK') { throw "Native MinGW gfortran-built executable failed its runtime preflight." }
           Remove-Item -Force $fortranSource, $fortranExe
           Write-Host "Verified native MinGW pkg-config and gfortran for pinned vcpkg."
 
@@ -124,12 +101,9 @@ jobs:
           $text = Get-Content $path -Raw
           $old = 'find_package(Glew ${COLMAP_FIND_TYPE})'
           $new = 'find_package(GLEW ${COLMAP_FIND_TYPE})'
-          if (-not $text.Contains($old)) {
-            throw "Expected legacy Glew find_package line not found; upstream changed, refusing blind patch."
-          }
+          if (-not $text.Contains($old)) { throw "Expected legacy Glew find_package line not found; upstream changed, refusing blind patch." }
           $text = $text.Replace($old, $new)
           Set-Content -Path $path -Value $text -NoNewline
-          Write-Host "Patched legacy find_package(Glew) to CMake/vcpkg-compatible find_package(GLEW)."
 
       - name: Fetch and repair upstream-pinned vcpkg baseline
         shell: pwsh
@@ -140,9 +114,6 @@ jobs:
           git -C vcpkg checkout --detach FETCH_HEAD
           git -C vcpkg rev-parse HEAD | Tee-Object -FilePath VCPKG_COMMIT.txt
 
-          # Repair only fossilized bootstrap-tool discovery. Package versions
-          # and scientific/runtime dependencies remain pinned to upstream's own
-          # historical Windows baseline.
           $pkgHelper = "vcpkg/scripts/cmake/vcpkg_find_acquire_program(PKGCONFIG).cmake"
           $pkgText = Get-Content $pkgHelper -Raw
           $pkgOld = "set(program_name pkg-config)`nif(DEFINED ENV{PKG_CONFIG})"
@@ -156,23 +127,20 @@ jobs:
             'if(DEFINED ENV{PKG_CONFIG})'
           )
           $pkgNew = $pkgNewLines -join "`n"
-          if (-not $pkgText.Contains($pkgOld)) {
-            throw "Expected legacy pkg-config helper prologue not found; refusing blind patch."
-          }
+          if (-not $pkgText.Contains($pkgOld)) { throw "Expected legacy pkg-config helper prologue not found; refusing blind patch." }
           $pkgText = $pkgText.Replace($pkgOld, $pkgNew)
           Set-Content -Path $pkgHelper -Value $pkgText -NoNewline
-          Write-Host "Patched legacy vcpkg helper to use current native MinGW pkg-config."
 
-          # vcpkg also sanitizes PATH before vcpkg_find_fortran() runs, so the
-          # valid runner gfortran is invisible there. Short-circuit the helper
-          # to pass the already-preflighted absolute compiler path directly to
-          # LAPACK's CMake configure. Keep VCPKG_USE_INTERNAL_Fortran false so
-          # lapack-reference[noblas] retains its supported external-compiler path.
+          # vcpkg sanitizes PATH inside port builds. Inject the absolute,
+          # preflighted external compiler after a single unique helper line.
           $fortranHelper = "vcpkg/scripts/cmake/vcpkg_find_fortran.cmake"
           $fortranText = Get-Content $fortranHelper -Raw
-          $fortranOld = "    vcpkg_list(SET additional_cmake_args)`n`n    set(CMAKE_BINARY_DIR"
-          $fortranNewLines = @(
-            '    vcpkg_list(SET additional_cmake_args)',
+          $fortranNeedle = '    vcpkg_list(SET additional_cmake_args)'
+          $needleMatches = ([regex]::Matches($fortranText, [regex]::Escape($fortranNeedle))).Count
+          if ($needleMatches -ne 1) { throw "Expected exactly one Fortran helper insertion point; found $needleMatches." }
+          $nl = [Environment]::NewLine
+          $fortranInjection = @(
+            $fortranNeedle,
             '',
             '    if(CMAKE_HOST_WIN32 AND EXISTS "C:/msys64/mingw64/bin/gfortran.exe")',
             '        message(STATUS "Using preflighted runner-provided MinGW gfortran.")',
@@ -182,15 +150,9 @@ jobs:
             '            "-DCMAKE_Fortran_FLAGS_INIT:STRING= -mabi=ms -m64 ${VCPKG_Fortran_FLAGS}")',
             '        set("${out_var}" "${additional_cmake_args}" PARENT_SCOPE)',
             '        return()',
-            '    endif()',
-            '',
-            '    set(CMAKE_BINARY_DIR'
-          )
-          $fortranNew = $fortranNewLines -join "`n"
-          if (-not $fortranText.Contains($fortranOld)) {
-            throw "Expected legacy Fortran helper prologue not found; refusing blind patch."
-          }
-          $fortranText = $fortranText.Replace($fortranOld, $fortranNew)
+            '    endif()'
+          ) -join $nl
+          $fortranText = $fortranText.Replace($fortranNeedle, $fortranInjection)
           Set-Content -Path $fortranHelper -Value $fortranText -NoNewline
           Write-Host "Patched legacy vcpkg Fortran discovery to use current runner gfortran directly."
 
@@ -266,14 +228,10 @@ jobs:
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             $patterns = 'error C\d+|fatal error|CMake Error|MSB\d+|FAILED:|error:'
-            Select-String -Path $log -Pattern $patterns |
-              ForEach-Object { $_.Line } |
-              Select-Object -First 300 |
-              Set-Content build-errors.txt
+            Select-String -Path $log -Pattern $patterns | ForEach-Object { $_.Line } | Select-Object -First 300 | Set-Content build-errors.txt
             if (-not (Test-Path build-errors.txt) -or (Get-Item build-errors.txt).Length -eq 0) {
               "Build failed with exit code $code, but no standard compiler-error pattern matched. See build-output.txt." | Set-Content build-errors.txt
             }
-            Write-Host "===== compact build errors ====="
             Get-Content build-errors.txt
             exit $code
           }
@@ -311,9 +269,8 @@ jobs:
           @"
           CPU-only, GUI-free Windows build of MDSKiel/colmap_underwater.
           Source is pinned to the commit in UPSTREAM_COMMIT.txt.
-          Dependency package definitions are pinned to the upstream project's own
-          Windows vcpkg baseline in VCPKG_COMMIT.txt. Qt, CUDA, CGAL, GUI, OpenGL,
-          and tests are intentionally excluded for the MP3D calibration use case.
+          Dependency package definitions are pinned to the upstream project's own Windows vcpkg baseline in VCPKG_COMMIT.txt.
+          Qt, CUDA, CGAL, GUI, OpenGL, and tests are intentionally excluded.
           Run VERIFY_REFRACTIVE_BUILD.cmd before use.
           "@ | Set-Content artifact\README_BUILD.txt
           @"
