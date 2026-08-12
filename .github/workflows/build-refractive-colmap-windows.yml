@@ -257,6 +257,30 @@ jobs:
           if (Test-Path vcpkg\installed\x64-windows\bin) {
             Copy-Item vcpkg\installed\x64-windows\bin\*.dll artifact\ -ErrorAction SilentlyContinue
           }
+
+          # Make the package no-install portable on supported Windows by
+          # carrying the redistributable VC++ and OpenMP runtime DLLs that
+          # dumpbin reports as direct colmap.exe dependencies.
+          if (-not $env:VCToolsRedistDir -or -not (Test-Path $env:VCToolsRedistDir)) {
+            throw "VCToolsRedistDir is unavailable; refusing to publish a package that silently depends on a preinstalled VC runtime."
+          }
+          $vcRuntimeDirs = @(
+            (Join-Path $env:VCToolsRedistDir "x64\Microsoft.VC143.CRT"),
+            (Join-Path $env:VCToolsRedistDir "x64\Microsoft.VC143.OpenMP")
+          )
+          foreach ($runtimeDir in $vcRuntimeDirs) {
+            if (-not (Test-Path $runtimeDir)) {
+              throw "Expected MSVC redistributable runtime directory is missing: $runtimeDir"
+            }
+            Copy-Item (Join-Path $runtimeDir "*.dll") artifact\ -ErrorAction Stop
+          }
+          $requiredVcRuntime = @("MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "VCOMP140.DLL")
+          foreach ($runtimeDll in $requiredVcRuntime) {
+            if (-not (Test-Path (Join-Path "artifact" $runtimeDll))) {
+              throw "Required redistributable runtime DLL was not packaged: $runtimeDll"
+            }
+          }
+
           Copy-Item UPSTREAM_COMMIT.txt artifact\UPSTREAM_COMMIT.txt
           Copy-Item VCPKG_COMMIT.txt artifact\VCPKG_COMMIT.txt
 
@@ -275,12 +299,20 @@ jobs:
           vcpkg package definitions are pinned by VCPKG_COMMIT.txt.
           Ceres uses its supported EigenSparse backend; SuiteSparse, LAPACK,
           Fortran, CUDA, CGAL, GUI, OpenGL runtime support, and tests are omitted.
+          Redistributable MSVC x64 CRT/OpenMP runtime DLLs are bundled so no
+          separate Visual C++ Redistributable installation is intended.
           Run VERIFY_REFRACTIVE_BUILD.cmd before use.
           "@ | Set-Content artifact\README_BUILD.txt
           @"
           @echo off
           setlocal
           cd /d "%~dp0"
+          for %%D in (MSVCP140.dll VCRUNTIME140.dll VCRUNTIME140_1.dll VCOMP140.DLL) do (
+            if not exist "%%D" (
+              echo ERROR: missing bundled runtime %%D
+              exit /b 3
+            )
+          )
           colmap.exe -h > colmap_help.txt 2>&1
           if errorlevel 1 exit /b 1
           colmap.exe feature_extractor -h > feature_extractor_help.txt 2>&1
@@ -289,7 +321,7 @@ jobs:
             echo ERROR: feature_extractor help does not expose camera_refrac_model.
             exit /b 2
           )
-          echo VERIFIED: Refractive COLMAP camera options are present.
+          echo VERIFIED: Refractive COLMAP camera options and bundled VC runtime are present.
           "@ | Set-Content artifact\VERIFY_REFRACTIVE_BUILD.cmd
 
       - name: Smoke-test refractive executable
@@ -298,6 +330,13 @@ jobs:
           $summary = Join-Path $PWD "artifact\smoke-summary.txt"
           Remove-Item $summary -ErrorAction SilentlyContinue
           $ok = $true
+
+          $requiredVcRuntime = @("MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "VCOMP140.DLL")
+          foreach ($runtimeDll in $requiredVcRuntime) {
+            $present = Test-Path (Join-Path "artifact" $runtimeDll)
+            "bundled_$runtimeDll=$present" | Add-Content $summary
+            if (-not $present) { $ok = $false }
+          }
 
           Push-Location artifact
           try {
