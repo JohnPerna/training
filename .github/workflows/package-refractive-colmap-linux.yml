@@ -1,0 +1,61 @@
+name: Package refractive COLMAP Linux runtime
+
+on:
+  push:
+    branches: [mp3d-refractive-colmap-linux-package]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime dependency set
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libmetis5 libfreeimage3 libceres4t64 libgoogle-glog0v6t64 \
+            libboost-filesystem1.83.0 libboost-program-options1.83.0
+
+      - name: Download already-built pinned executable
+        uses: actions/download-artifact@v4
+        with:
+          name: refractive-colmap-linux-x64-cpu
+          run-id: 31648931684
+          github-token: ${{ github.token }}
+          path: input
+
+      - name: Bundle runtime libraries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p artifact/lib
+          cp input/colmap artifact/colmap
+          cp input/UPSTREAM_COMMIT.txt artifact/
+          chmod +x artifact/colmap
+          ldd artifact/colmap > artifact/ldd.txt
+          ldd artifact/colmap | awk '/=> \/|^\// {for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' | sort -u > artifact/runtime-paths.txt
+          while read -r lib; do cp -L "$lib" artifact/lib/; done < artifact/runtime-paths.txt
+          sha256sum artifact/colmap > artifact/SHA256SUMS.txt
+          cat > artifact/run-colmap.sh <<'EOF'
+          #!/usr/bin/env bash
+          HERE="$(cd "$(dirname "$0")" && pwd)"
+          export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$HERE/colmap" "$@"
+          EOF
+          chmod +x artifact/run-colmap.sh
+          artifact/run-colmap.sh -h > artifact/colmap-help.txt 2>&1
+          artifact/run-colmap.sh feature_extractor -h > artifact/feature-extractor-help.txt 2>&1
+          grep -q camera_refrac_model artifact/feature-extractor-help.txt
+
+      - name: Upload bundled Linux runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: refractive-colmap-linux-x64-cpu-bundled
+          path: artifact/
+          if-no-files-found: error
