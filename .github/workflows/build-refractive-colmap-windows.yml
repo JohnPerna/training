@@ -19,7 +19,7 @@ jobs:
       VCPKG_FORCE_SYSTEM_BINARIES: 1
       COLMAP_UNDERWATER_COMMIT: "5b73ae1a61856c4e712908a353c951a1ba2bc748"
       VCPKG_BASELINE_COMMIT: "4c1734ba2a969b1e6daa0ac79bc46ead7324df90"
-      VCPKG_CACHE_KEY: "refractive-colmap-vcpkg-win64-4c1734ba-deps-v3"
+      VCPKG_CACHE_KEY: "refractive-colmap-vcpkg-win64-4c1734ba-eigensparse-v1"
 
     steps:
       - name: Checkout build harness
@@ -27,6 +27,8 @@ jobs:
 
       - name: Enable MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Expose runner 7-Zip to pinned vcpkg
         shell: pwsh
@@ -39,51 +41,52 @@ jobs:
           $sevenZipDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & $sevenZipExe | Select-Object -First 4
 
-      - name: Install current MinGW build tools and preflight compatibility
+      - name: Install native pkg-config and preflight Windows path semantics
         shell: pwsh
         run: |
           $bash = "C:\msys64\usr\bin\bash.exe"
           $mingwBin = "C:\msys64\mingw64\bin"
-          if (-not (Test-Path $bash)) { throw "GitHub Windows runner no longer provides MSYS2 at $bash" }
-          & $bash -lc "pacman -Sy --needed --noconfirm mingw-w64-x86_64-pkgconf mingw-w64-x86_64-gcc-fortran"
-          if ($LASTEXITCODE -ne 0) { throw "Could not install current MSYS2 MinGW pkgconf/gfortran." }
+          if (-not (Test-Path $bash)) {
+            throw "GitHub Windows runner no longer provides MSYS2 at $bash"
+          }
+
+          & $bash -lc "pacman -Sy --needed --noconfirm mingw-w64-x86_64-pkgconf"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not install current MSYS2 MinGW pkgconf."
+          }
 
           $pkgConfig = Join-Path $mingwBin "pkg-config.exe"
-          $gfortran = Join-Path $mingwBin "gfortran.exe"
-          foreach ($tool in @($pkgConfig, $gfortran)) {
-            if (-not (Test-Path $tool)) { throw "Expected MinGW tool is missing: $tool" }
+          if (-not (Test-Path $pkgConfig)) {
+            throw "Native MinGW pkg-config is missing at $pkgConfig"
           }
-          $env:PATH = "$mingwBin;$env:PATH"
-          $mingwBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          "PKG_CONFIG=$pkgConfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
           & $pkgConfig --version
-          if ($LASTEXITCODE -ne 0) { throw "Native MinGW pkg-config failed its version check." }
-          & $gfortran --version | Select-Object -First 1
-          if ($LASTEXITCODE -ne 0) { throw "Native MinGW gfortran failed its version check." }
+          if ($LASTEXITCODE -ne 0) {
+            throw "Native MinGW pkg-config failed its version check."
+          }
 
           $probe1 = Join-Path $pwd "pkgconf_probe_empty"
           $probe2 = Join-Path $pwd "pkgconf_probe_hit"
           New-Item -ItemType Directory -Force $probe1, $probe2 | Out-Null
-          @('prefix=C:/mp3d-probe','Name: mp3d-pkgconf-probe','Description: vcpkg Windows path semantics probe','Version: 1.0','Libs:','Cflags:') |
-            Set-Content (Join-Path $probe2 "mp3d-pkgconf-probe.pc")
+          @(
+            'prefix=C:/mp3d-probe',
+            'Name: mp3d-pkgconf-probe',
+            'Description: vcpkg Windows path semantics probe',
+            'Version: 1.0',
+            'Libs:',
+            'Cflags:'
+          ) | Set-Content (Join-Path $probe2 "mp3d-pkgconf-probe.pc")
           $oldPkgPath = $env:PKG_CONFIG_PATH
           $env:PKG_CONFIG_PATH = "$probe1;$probe2"
           & $pkgConfig --exists mp3d-pkgconf-probe
-          $pkgProbeCode = $LASTEXITCODE
+          $probeCode = $LASTEXITCODE
           $env:PKG_CONFIG_PATH = $oldPkgPath
           Remove-Item -Recurse -Force $probe1, $probe2
-          if ($pkgProbeCode -ne 0) { throw "Native MinGW pkg-config cannot resolve vcpkg-style Windows semicolon PKG_CONFIG_PATH." }
+          if ($probeCode -ne 0) {
+            throw "Native MinGW pkg-config cannot resolve vcpkg-style Windows semicolon PKG_CONFIG_PATH."
+          }
 
-          $fortranSource = Join-Path $pwd "gfortran_probe.f90"
-          $fortranExe = Join-Path $pwd "gfortran_probe.exe"
-          @('program mp3d_probe','  print *, "MP3D_GFORTRAN_OK"','end program mp3d_probe') | Set-Content $fortranSource
-          & $gfortran -m64 $fortranSource -o $fortranExe
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $fortranExe)) { throw "Native MinGW gfortran failed the compile/link preflight." }
-          $fortranOutput = & $fortranExe 2>&1 | Out-String
-          if ($LASTEXITCODE -ne 0 -or $fortranOutput -notmatch 'MP3D_GFORTRAN_OK') { throw "Native MinGW gfortran-built executable failed its runtime preflight." }
-          Remove-Item -Force $fortranSource, $fortranExe
-          Write-Host "Verified native MinGW pkg-config and gfortran for pinned vcpkg."
+          "PKG_CONFIG=$pkgConfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Verified native MinGW pkg-config for legacy vcpkg."
 
       - name: Fetch pinned COLMAP Underwater source
         shell: pwsh
@@ -94,14 +97,16 @@ jobs:
           git -C colmap_underwater checkout --detach FETCH_HEAD
           git -C colmap_underwater rev-parse HEAD | Tee-Object -FilePath UPSTREAM_COMMIT.txt
 
-      - name: Patch legacy Glew package name for modern Windows CMake
+      - name: Patch legacy GLEW package spelling
         shell: pwsh
         run: |
           $path = "colmap_underwater/cmake/FindDependencies.cmake"
           $text = Get-Content $path -Raw
           $old = 'find_package(Glew ${COLMAP_FIND_TYPE})'
           $new = 'find_package(GLEW ${COLMAP_FIND_TYPE})'
-          if (-not $text.Contains($old)) { throw "Expected legacy Glew find_package line not found; upstream changed, refusing blind patch." }
+          if (-not $text.Contains($old)) {
+            throw "Expected legacy Glew find_package line not found; upstream changed, refusing blind patch."
+          }
           $text = $text.Replace($old, $new)
           Set-Content -Path $path -Value $text -NoNewline
 
@@ -114,51 +119,30 @@ jobs:
           git -C vcpkg checkout --detach FETCH_HEAD
           git -C vcpkg rev-parse HEAD | Tee-Object -FilePath VCPKG_COMMIT.txt
 
+          # Keep upstream's pinned 2023 package definitions, but replace only
+          # its dead historical pkgconf bootstrap with the current runner tool.
           $pkgHelper = "vcpkg/scripts/cmake/vcpkg_find_acquire_program(PKGCONFIG).cmake"
           $pkgText = Get-Content $pkgHelper -Raw
-          $pkgOld = "set(program_name pkg-config)`nif(DEFINED ENV{PKG_CONFIG})"
-          $pkgNewLines = @(
+          $needle = 'set(program_name pkg-config)'
+          $count = ([regex]::Matches($pkgText, [regex]::Escape($needle))).Count
+          if ($count -ne 1) {
+            throw "Expected one pkg-config helper insertion point; found $count."
+          }
+          $nl = [Environment]::NewLine
+          $replacement = @(
             'set(program_name pkg-config)',
             'if(CMAKE_HOST_WIN32 AND EXISTS "C:/msys64/mingw64/bin/pkg-config.exe")',
             '    set(PKGCONFIG "C:/msys64/mingw64/bin/pkg-config.exe" CACHE INTERNAL "" FORCE)',
             '    set(PKGCONFIG "${PKGCONFIG}" PARENT_SCOPE)',
             '    return()',
-            'endif()',
-            'if(DEFINED ENV{PKG_CONFIG})'
-          )
-          $pkgNew = $pkgNewLines -join "`n"
-          if (-not $pkgText.Contains($pkgOld)) { throw "Expected legacy pkg-config helper prologue not found; refusing blind patch." }
-          $pkgText = $pkgText.Replace($pkgOld, $pkgNew)
-          Set-Content -Path $pkgHelper -Value $pkgText -NoNewline
-
-          # vcpkg sanitizes PATH inside port builds. Inject the absolute,
-          # preflighted external compiler after a single unique helper line.
-          $fortranHelper = "vcpkg/scripts/cmake/vcpkg_find_fortran.cmake"
-          $fortranText = Get-Content $fortranHelper -Raw
-          $fortranNeedle = '    vcpkg_list(SET additional_cmake_args)'
-          $needleMatches = ([regex]::Matches($fortranText, [regex]::Escape($fortranNeedle))).Count
-          if ($needleMatches -ne 1) { throw "Expected exactly one Fortran helper insertion point; found $needleMatches." }
-          $nl = [Environment]::NewLine
-          $fortranInjection = @(
-            $fortranNeedle,
-            '',
-            '    if(CMAKE_HOST_WIN32 AND EXISTS "C:/msys64/mingw64/bin/gfortran.exe")',
-            '        message(STATUS "Using preflighted runner-provided MinGW gfortran.")',
-            '        vcpkg_list(APPEND additional_cmake_args',
-            '            -DCMAKE_GNUtoMS=ON',
-            '            "-DCMAKE_Fortran_COMPILER=C:/msys64/mingw64/bin/gfortran.exe"',
-            '            "-DCMAKE_Fortran_FLAGS_INIT:STRING= -mabi=ms -m64 ${VCPKG_Fortran_FLAGS}")',
-            '        set("${out_var}" "${additional_cmake_args}" PARENT_SCOPE)',
-            '        return()',
-            '    endif()'
+            'endif()'
           ) -join $nl
-          $fortranText = $fortranText.Replace($fortranNeedle, $fortranInjection)
-          Set-Content -Path $fortranHelper -Value $fortranText -NoNewline
-          Write-Host "Patched legacy vcpkg Fortran discovery to use current runner gfortran directly."
+          $pkgText = $pkgText.Replace($needle, $replacement)
+          Set-Content -Path $pkgHelper -Value $pkgText -NoNewline
 
           .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
-      - name: Restore pinned dependency tree
+      - name: Restore pinned EigenSparse dependency tree
         id: restore-vcpkg
         uses: actions/cache/restore@v4
         with:
@@ -167,9 +151,12 @@ jobs:
           restore-keys: |
             ${{ env.VCPKG_CACHE_KEY }}-partial-
 
-      - name: Install pinned CPU headless dependencies
+      - name: Install CPU headless dependencies
         shell: pwsh
         run: |
+          # EigenSparse is a supported Ceres sparse backend and avoids the
+          # optional SuiteSparse/LAPACK/Fortran chain. COLMAP itself only asks
+          # for Ceres and dynamically chooses dense/sparse/iterative Schur.
           .\vcpkg\vcpkg.exe install `
             boost-algorithm `
             boost-filesystem `
@@ -189,7 +176,7 @@ jobs:
             glog `
             sqlite3 `
             glew `
-            "ceres[lapack,suitesparse]" `
+            "ceres[eigensparse]" `
             --triplet x64-windows `
             --clean-after-build
 
@@ -207,9 +194,10 @@ jobs:
           path: vcpkg/installed
           key: ${{ env.VCPKG_CACHE_KEY }}
 
-      - name: Configure underwater fork against pinned vcpkg baseline
+      - name: Configure underwater fork
         shell: pwsh
         run: |
+          $log = "configure-output.txt"
           cmake -S colmap_underwater -B build -A x64 `
             -DCMAKE_TOOLCHAIN_FILE="$pwd/vcpkg/scripts/buildsystems/vcpkg.cmake" `
             -DCMAKE_BUILD_TYPE=Release `
@@ -218,7 +206,10 @@ jobs:
             -DOPENGL_ENABLED=OFF `
             -DCGAL_ENABLED=OFF `
             -DIPO_ENABLED=OFF `
-            -DTESTS_ENABLED=OFF
+            -DTESTS_ENABLED=OFF 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
 
       - name: Build underwater COLMAP executable
         shell: pwsh
@@ -228,7 +219,10 @@ jobs:
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             $patterns = 'error C\d+|fatal error|CMake Error|MSB\d+|FAILED:|error:'
-            Select-String -Path $log -Pattern $patterns | ForEach-Object { $_.Line } | Select-Object -First 300 | Set-Content build-errors.txt
+            Select-String -Path $log -Pattern $patterns |
+              ForEach-Object { $_.Line } |
+              Select-Object -First 300 |
+              Set-Content build-errors.txt
             if (-not (Test-Path build-errors.txt) -or (Get-Item build-errors.txt).Length -eq 0) {
               "Build failed with exit code $code, but no standard compiler-error pattern matched. See build-output.txt." | Set-Content build-errors.txt
             }
@@ -236,12 +230,13 @@ jobs:
             exit $code
           }
 
-      - name: Upload build diagnostics on failure
+      - name: Upload diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: refractive-colmap-build-errors
           path: |
+            configure-output.txt
             build-errors.txt
             build-output.txt
             UPSTREAM_COMMIT.txt
@@ -250,27 +245,26 @@ jobs:
           compression-level: 6
           retention-days: 7
 
-      - name: Locate executable and assemble portable runtime
+      - name: Assemble portable runtime
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifact | Out-Null
           $exe = Get-ChildItem -Path build -Recurse -Filter colmap.exe | Select-Object -First 1
-          if (-not $exe) { throw "Could not locate built colmap.exe" }
+          if (-not $exe) {
+            throw "Could not locate built colmap.exe"
+          }
           Copy-Item $exe.FullName artifact\colmap.exe
           if (Test-Path vcpkg\installed\x64-windows\bin) {
             Copy-Item vcpkg\installed\x64-windows\bin\*.dll artifact\ -ErrorAction SilentlyContinue
-          }
-          foreach ($dll in @('libgfortran-5.dll','libquadmath-0.dll','libwinpthread-1.dll','libgcc_s_seh-1.dll')) {
-            $src = Join-Path 'C:\msys64\mingw64\bin' $dll
-            if (Test-Path $src) { Copy-Item $src artifact\ }
           }
           Copy-Item UPSTREAM_COMMIT.txt artifact\UPSTREAM_COMMIT.txt
           Copy-Item VCPKG_COMMIT.txt artifact\VCPKG_COMMIT.txt
           @"
           CPU-only, GUI-free Windows build of MDSKiel/colmap_underwater.
-          Source is pinned to the commit in UPSTREAM_COMMIT.txt.
-          Dependency package definitions are pinned to the upstream project's own Windows vcpkg baseline in VCPKG_COMMIT.txt.
-          Qt, CUDA, CGAL, GUI, OpenGL, and tests are intentionally excluded.
+          Source is pinned by UPSTREAM_COMMIT.txt.
+          vcpkg package definitions are pinned by VCPKG_COMMIT.txt.
+          Ceres uses its supported EigenSparse backend; SuiteSparse, LAPACK,
+          Fortran, CUDA, CGAL, GUI, OpenGL runtime support, and tests are omitted.
           Run VERIFY_REFRACTIVE_BUILD.cmd before use.
           "@ | Set-Content artifact\README_BUILD.txt
           @"
@@ -288,12 +282,18 @@ jobs:
           echo VERIFIED: Refractive COLMAP camera options are present.
           "@ | Set-Content artifact\VERIFY_REFRACTIVE_BUILD.cmd
 
-      - name: Smoke-test built executable
+      - name: Smoke-test refractive executable
         shell: pwsh
         run: |
           Push-Location artifact
           .\colmap.exe -h
+          if ($LASTEXITCODE -ne 0) {
+            throw "colmap.exe -h failed."
+          }
           .\colmap.exe feature_extractor -h | Tee-Object -FilePath feature_extractor_help_ci.txt
+          if ($LASTEXITCODE -ne 0) {
+            throw "colmap.exe feature_extractor -h failed."
+          }
           $help = Get-Content feature_extractor_help_ci.txt -Raw
           if ($help -notmatch '(?i)camera_refrac_model') {
             throw "Built executable does not expose ImageReader.camera_refrac_model; refusing to publish artifact."
