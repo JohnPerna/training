@@ -1,0 +1,66 @@
+name: Build refractive COLMAP Linux
+
+on:
+  push:
+    branches: [mp3d-refractive-colmap-linux-build]
+  workflow_dispatch:
+
+concurrency:
+  group: refractive-colmap-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build git \
+            libboost-program-options-dev libboost-filesystem-dev libboost-graph-dev libboost-system-dev \
+            libeigen3-dev libfreeimage-dev libmetis-dev libgoogle-glog-dev libgflags-dev \
+            libsqlite3-dev libglew-dev libgl1-mesa-dev libcgal-dev libceres-dev
+
+      - name: Fetch pinned underwater source
+        run: |
+          git clone https://github.com/MDSKiel/colmap_underwater.git source
+          cd source
+          git checkout 5b73ae1a61856c4e712908a353c951a1ba2bc748
+          test "$(git rev-parse HEAD)" = "5b73ae1a61856c4e712908a353c951a1ba2bc748"
+
+      - name: Configure headless CPU build
+        run: |
+          cmake -S source -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCUDA_ENABLED=OFF \
+            -DGUI_ENABLED=OFF \
+            -DOPENGL_ENABLED=OFF \
+            -DCGAL_ENABLED=OFF \
+            -DIPO_ENABLED=OFF \
+            -DTESTS_ENABLED=OFF
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Locate executable and smoke test
+        shell: bash
+        run: |
+          EXE=$(find build -type f -name colmap -perm -111 | head -1)
+          test -n "$EXE"
+          mkdir -p artifact
+          cp "$EXE" artifact/colmap
+          "$EXE" -h > artifact/colmap-help.txt 2>&1
+          "$EXE" feature_extractor -h > artifact/feature-extractor-help.txt 2>&1
+          grep -q camera_refrac_model artifact/feature-extractor-help.txt
+          echo 5b73ae1a61856c4e712908a353c951a1ba2bc748 > artifact/UPSTREAM_COMMIT.txt
+          ldd "$EXE" > artifact/ldd.txt || true
+
+      - name: Upload Linux build
+        uses: actions/upload-artifact@v4
+        with:
+          name: refractive-colmap-linux-x64-cpu
+          path: artifact/
+          if-no-files-found: error
