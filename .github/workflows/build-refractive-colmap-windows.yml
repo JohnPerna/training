@@ -1,0 +1,416 @@
+name: Build Refractive COLMAP Windows
+
+on:
+  push:
+    branches: [mp3d-refractive-colmap-build]
+  workflow_dispatch:
+
+concurrency:
+  group: refractive-colmap-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      VCPKG_DISABLE_METRICS: 1
+      VCPKG_BINARY_SOURCES: "clear"
+      VCPKG_FORCE_SYSTEM_BINARIES: 1
+      COLMAP_UNDERWATER_COMMIT: "5b73ae1a61856c4e712908a353c951a1ba2bc748"
+      VCPKG_BASELINE_COMMIT: "4c1734ba2a969b1e6daa0ac79bc46ead7324df90"
+      VCPKG_CACHE_KEY: "refractive-colmap-vcpkg-win64-4c1734ba-eigensparse-v1"
+
+    steps:
+      - name: Checkout build harness
+        uses: actions/checkout@v4
+
+      - name: Enable MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Expose runner 7-Zip to pinned vcpkg
+        shell: pwsh
+        run: |
+          $sevenZipDir = "C:\Program Files\7-Zip"
+          $sevenZipExe = Join-Path $sevenZipDir "7z.exe"
+          if (-not (Test-Path $sevenZipExe)) {
+            throw "GitHub Windows runner no longer provides $sevenZipExe"
+          }
+          $sevenZipDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $sevenZipExe | Select-Object -First 4
+
+      - name: Install native pkg-config and preflight Windows path semantics
+        shell: pwsh
+        run: |
+          $bash = "C:\msys64\usr\bin\bash.exe"
+          $mingwBin = "C:\msys64\mingw64\bin"
+          if (-not (Test-Path $bash)) {
+            throw "GitHub Windows runner no longer provides MSYS2 at $bash"
+          }
+
+          & $bash -lc "pacman -Sy --needed --noconfirm mingw-w64-x86_64-pkgconf"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not install current MSYS2 MinGW pkgconf."
+          }
+
+          $pkgConfig = Join-Path $mingwBin "pkg-config.exe"
+          if (-not (Test-Path $pkgConfig)) {
+            throw "Native MinGW pkg-config is missing at $pkgConfig"
+          }
+          & $pkgConfig --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Native MinGW pkg-config failed its version check."
+          }
+
+          $probe1 = Join-Path $pwd "pkgconf_probe_empty"
+          $probe2 = Join-Path $pwd "pkgconf_probe_hit"
+          New-Item -ItemType Directory -Force $probe1, $probe2 | Out-Null
+          @(
+            'prefix=C:/mp3d-probe',
+            'Name: mp3d-pkgconf-probe',
+            'Description: vcpkg Windows path semantics probe',
+            'Version: 1.0',
+            'Libs:',
+            'Cflags:'
+          ) | Set-Content (Join-Path $probe2 "mp3d-pkgconf-probe.pc")
+          $oldPkgPath = $env:PKG_CONFIG_PATH
+          $env:PKG_CONFIG_PATH = "$probe1;$probe2"
+          & $pkgConfig --exists mp3d-pkgconf-probe
+          $probeCode = $LASTEXITCODE
+          $env:PKG_CONFIG_PATH = $oldPkgPath
+          Remove-Item -Recurse -Force $probe1, $probe2
+          if ($probeCode -ne 0) {
+            throw "Native MinGW pkg-config cannot resolve vcpkg-style Windows semicolon PKG_CONFIG_PATH."
+          }
+
+          "PKG_CONFIG=$pkgConfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Verified native MinGW pkg-config for legacy vcpkg."
+
+      - name: Fetch pinned COLMAP Underwater source
+        shell: pwsh
+        run: |
+          git init colmap_underwater
+          git -C colmap_underwater remote add origin https://github.com/MDSKiel/colmap_underwater.git
+          git -C colmap_underwater fetch --depth 1 origin $env:COLMAP_UNDERWATER_COMMIT
+          git -C colmap_underwater checkout --detach FETCH_HEAD
+          git -C colmap_underwater rev-parse HEAD | Tee-Object -FilePath UPSTREAM_COMMIT.txt
+
+      - name: Patch legacy GLEW package spelling
+        shell: pwsh
+        run: |
+          $path = "colmap_underwater/cmake/FindDependencies.cmake"
+          $text = Get-Content $path -Raw
+          $old = 'find_package(Glew ${COLMAP_FIND_TYPE})'
+          $new = 'find_package(GLEW ${COLMAP_FIND_TYPE})'
+          if (-not $text.Contains($old)) {
+            throw "Expected legacy Glew find_package line not found; upstream changed, refusing blind patch."
+          }
+          $text = $text.Replace($old, $new)
+          Set-Content -Path $path -Value $text -NoNewline
+
+      - name: Fetch and repair upstream-pinned vcpkg baseline
+        shell: pwsh
+        run: |
+          git init vcpkg
+          git -C vcpkg remote add origin https://github.com/microsoft/vcpkg.git
+          git -C vcpkg fetch --depth 1 origin $env:VCPKG_BASELINE_COMMIT
+          git -C vcpkg checkout --detach FETCH_HEAD
+          git -C vcpkg rev-parse HEAD | Tee-Object -FilePath VCPKG_COMMIT.txt
+
+          # Keep upstream's pinned 2023 package definitions, but replace only
+          # its dead historical pkgconf bootstrap with the current runner tool.
+          $pkgHelper = "vcpkg/scripts/cmake/vcpkg_find_acquire_program(PKGCONFIG).cmake"
+          $pkgText = Get-Content $pkgHelper -Raw
+          $needle = 'set(program_name pkg-config)'
+          $count = ([regex]::Matches($pkgText, [regex]::Escape($needle))).Count
+          if ($count -ne 1) {
+            throw "Expected one pkg-config helper insertion point; found $count."
+          }
+          $nl = [Environment]::NewLine
+          $replacement = @(
+            'set(program_name pkg-config)',
+            'if(CMAKE_HOST_WIN32 AND EXISTS "C:/msys64/mingw64/bin/pkg-config.exe")',
+            '    set(PKGCONFIG "C:/msys64/mingw64/bin/pkg-config.exe" CACHE INTERNAL "" FORCE)',
+            '    set(PKGCONFIG "${PKGCONFIG}" PARENT_SCOPE)',
+            '    return()',
+            'endif()'
+          ) -join $nl
+          $pkgText = $pkgText.Replace($needle, $replacement)
+          Set-Content -Path $pkgHelper -Value $pkgText -NoNewline
+
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Restore pinned EigenSparse dependency tree
+        id: restore-vcpkg
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg/installed
+          key: ${{ env.VCPKG_CACHE_KEY }}
+          restore-keys: |
+            ${{ env.VCPKG_CACHE_KEY }}-partial-
+
+      - name: Install CPU headless dependencies
+        shell: pwsh
+        run: |
+          # EigenSparse is a supported Ceres sparse backend and avoids the
+          # optional SuiteSparse/LAPACK/Fortran chain. COLMAP itself only asks
+          # for Ceres and dynamically chooses dense/sparse/iterative Schur.
+          .\vcpkg\vcpkg.exe install `
+            boost-algorithm `
+            boost-filesystem `
+            boost-graph `
+            boost-heap `
+            boost-program-options `
+            boost-property-map `
+            boost-property-tree `
+            boost-regex `
+            boost-system `
+            eigen3 `
+            freeimage `
+            flann `
+            lz4 `
+            metis `
+            gflags `
+            glog `
+            sqlite3 `
+            glew `
+            "ceres[eigensparse]" `
+            --triplet x64-windows `
+            --clean-after-build
+
+      - name: Preserve partial dependency progress on failure
+        if: failure() && steps.restore-vcpkg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg/installed
+          key: ${{ env.VCPKG_CACHE_KEY }}-partial-${{ github.run_id }}
+
+      - name: Save complete pinned dependency tree
+        if: success() && steps.restore-vcpkg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg/installed
+          key: ${{ env.VCPKG_CACHE_KEY }}
+
+      - name: Configure underwater fork
+        shell: pwsh
+        run: |
+          $log = "configure-output.txt"
+          cmake -S colmap_underwater -B build -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$pwd/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCUDA_ENABLED=OFF `
+            -DGUI_ENABLED=OFF `
+            -DOPENGL_ENABLED=OFF `
+            -DCGAL_ENABLED=OFF `
+            -DIPO_ENABLED=OFF `
+            -DTESTS_ENABLED=OFF 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Build underwater COLMAP executable
+        shell: pwsh
+        run: |
+          $log = "build-output.txt"
+          cmake --build build --config Release --target colmap_main --parallel 2 -- /verbosity:minimal 2>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $patterns = 'error C\d+|fatal error|CMake Error|MSB\d+|FAILED:|error:'
+            Select-String -Path $log -Pattern $patterns |
+              ForEach-Object { $_.Line } |
+              Select-Object -First 300 |
+              Set-Content build-errors.txt
+            if (-not (Test-Path build-errors.txt) -or (Get-Item build-errors.txt).Length -eq 0) {
+              "Build failed with exit code $code, but no standard compiler-error pattern matched. See build-output.txt." | Set-Content build-errors.txt
+            }
+            Get-Content build-errors.txt
+            exit $code
+          }
+
+      - name: Upload diagnostics on build failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refractive-colmap-build-errors
+          path: |
+            configure-output.txt
+            build-errors.txt
+            build-output.txt
+            UPSTREAM_COMMIT.txt
+            VCPKG_COMMIT.txt
+          if-no-files-found: ignore
+          compression-level: 6
+          retention-days: 7
+
+      - name: Assemble portable runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          $exe = Get-ChildItem -Path build -Recurse -Filter colmap.exe | Select-Object -First 1
+          if (-not $exe) {
+            throw "Could not locate built colmap.exe"
+          }
+          Copy-Item $exe.FullName artifact\colmap.exe
+          if (Test-Path vcpkg\installed\x64-windows\bin) {
+            Copy-Item vcpkg\installed\x64-windows\bin\*.dll artifact\ -ErrorAction SilentlyContinue
+          }
+
+          # Make the package no-install portable on supported Windows by
+          # carrying the redistributable VC++ and OpenMP runtime DLLs that
+          # dumpbin reports as direct colmap.exe dependencies.
+          if (-not $env:VCToolsRedistDir -or -not (Test-Path $env:VCToolsRedistDir)) {
+            throw "VCToolsRedistDir is unavailable; refusing to publish a package that silently depends on a preinstalled VC runtime."
+          }
+          $vcRuntimeDirs = @(
+            (Join-Path $env:VCToolsRedistDir "x64\Microsoft.VC143.CRT"),
+            (Join-Path $env:VCToolsRedistDir "x64\Microsoft.VC143.OpenMP")
+          )
+          foreach ($runtimeDir in $vcRuntimeDirs) {
+            if (-not (Test-Path $runtimeDir)) {
+              throw "Expected MSVC redistributable runtime directory is missing: $runtimeDir"
+            }
+            Copy-Item (Join-Path $runtimeDir "*.dll") artifact\ -ErrorAction Stop
+          }
+          $requiredVcRuntime = @("MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "VCOMP140.DLL")
+          foreach ($runtimeDll in $requiredVcRuntime) {
+            if (-not (Test-Path (Join-Path "artifact" $runtimeDll))) {
+              throw "Required redistributable runtime DLL was not packaged: $runtimeDll"
+            }
+          }
+
+          Copy-Item UPSTREAM_COMMIT.txt artifact\UPSTREAM_COMMIT.txt
+          Copy-Item VCPKG_COMMIT.txt artifact\VCPKG_COMMIT.txt
+
+          try {
+            dumpbin /DEPENDENTS artifact\colmap.exe 2>&1 | Set-Content artifact\colmap-dependents.txt
+          } catch {
+            $_ | Out-String | Set-Content artifact\colmap-dependents.txt
+          }
+          Get-ChildItem artifact | Select-Object Name, Length |
+            Format-Table -AutoSize | Out-String | Set-Content artifact\runtime-files.txt
+          "VCToolsRedistDir=$env:VCToolsRedistDir" | Set-Content artifact\runtime-env.txt
+
+          @"
+          CPU-only, GUI-free Windows build of MDSKiel/colmap_underwater.
+          Source is pinned by UPSTREAM_COMMIT.txt.
+          vcpkg package definitions are pinned by VCPKG_COMMIT.txt.
+          Ceres uses its supported EigenSparse backend; SuiteSparse, LAPACK,
+          Fortran, CUDA, CGAL, GUI, OpenGL runtime support, and tests are omitted.
+          Redistributable MSVC x64 CRT/OpenMP runtime DLLs are bundled so no
+          separate Visual C++ Redistributable installation is intended.
+          Run VERIFY_REFRACTIVE_BUILD.cmd before use.
+          "@ | Set-Content artifact\README_BUILD.txt
+          @"
+          @echo off
+          setlocal
+          cd /d "%~dp0"
+          for %%D in (MSVCP140.dll VCRUNTIME140.dll VCRUNTIME140_1.dll VCOMP140.DLL) do (
+            if not exist "%%D" (
+              echo ERROR: missing bundled runtime %%D
+              exit /b 3
+            )
+          )
+          colmap.exe -h > colmap_help.txt 2>&1
+          if errorlevel 1 exit /b 1
+          colmap.exe feature_extractor -h > feature_extractor_help.txt 2>&1
+          findstr /i /c:"camera_refrac_model" feature_extractor_help.txt >nul
+          if errorlevel 1 (
+            echo ERROR: feature_extractor help does not expose camera_refrac_model.
+            exit /b 2
+          )
+          echo VERIFIED: Refractive COLMAP camera options and bundled VC runtime are present.
+          "@ | Set-Content artifact\VERIFY_REFRACTIVE_BUILD.cmd
+
+      - name: Smoke-test refractive executable
+        shell: pwsh
+        run: |
+          $summary = Join-Path $PWD "artifact\smoke-summary.txt"
+          Remove-Item $summary -ErrorAction SilentlyContinue
+          $ok = $true
+
+          $requiredVcRuntime = @("MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "VCOMP140.DLL")
+          foreach ($runtimeDll in $requiredVcRuntime) {
+            $present = Test-Path (Join-Path "artifact" $runtimeDll)
+            "bundled_$runtimeDll=$present" | Add-Content $summary
+            if (-not $present) { $ok = $false }
+          }
+
+          Push-Location artifact
+          try {
+            try {
+              $output = & ".\colmap.exe" -h 2>&1
+              $code = $LASTEXITCODE
+              $output | Set-Content "colmap-help.txt"
+              "colmap -h exit_code=$code" | Add-Content $summary
+              if ($code -ne 0) { $ok = $false }
+            } catch {
+              $_ | Out-String | Set-Content "colmap-help.txt"
+              "colmap -h exception=$($_.Exception.Message)" | Add-Content $summary
+              $ok = $false
+            }
+
+            try {
+              $output = & ".\colmap.exe" feature_extractor -h 2>&1
+              $code = $LASTEXITCODE
+              $output | Set-Content "feature-extractor-help.txt"
+              "feature_extractor -h exit_code=$code" | Add-Content $summary
+              if ($code -ne 0) { $ok = $false }
+            } catch {
+              $_ | Out-String | Set-Content "feature-extractor-help.txt"
+              "feature_extractor -h exception=$($_.Exception.Message)" | Add-Content $summary
+              $ok = $false
+            }
+
+            try {
+              $output = & ".\colmap.exe" feature_extractor --help 2>&1
+              $code = $LASTEXITCODE
+              $output | Set-Content "feature-extractor-help-long.txt"
+              "feature_extractor --help exit_code=$code" | Add-Content $summary
+            } catch {
+              $_ | Out-String | Set-Content "feature-extractor-help-long.txt"
+              "feature_extractor --help exception=$($_.Exception.Message)" | Add-Content $summary
+            }
+
+            $help = ""
+            if (Test-Path "feature-extractor-help.txt") {
+              $help = Get-Content "feature-extractor-help.txt" -Raw
+            }
+            $hasRefrac = $help -match '(?i)camera_refrac_model'
+            "camera_refrac_model_present=$hasRefrac" | Add-Content $summary
+            if (-not $hasRefrac) { $ok = $false }
+          } finally {
+            Pop-Location
+          }
+
+          Get-Content $summary
+          if (-not $ok) {
+            throw "Smoke verification failed. See refractive-colmap-smoke-diagnostics artifact."
+          }
+
+      - name: Upload smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refractive-colmap-smoke-diagnostics
+          path: |
+            artifact/*help*.txt
+            artifact/*dependents*.txt
+            artifact/*smoke*.txt
+            artifact/*runtime*.txt
+            artifact/UPSTREAM_COMMIT.txt
+            artifact/VCPKG_COMMIT.txt
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 7
+
+      - name: Upload portable Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: refractive-colmap-windows-x64-cpu
+          path: artifact/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
