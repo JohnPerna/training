@@ -19,7 +19,7 @@ jobs:
       VCPKG_FORCE_SYSTEM_BINARIES: 1
       COLMAP_UNDERWATER_COMMIT: "5b73ae1a61856c4e712908a353c951a1ba2bc748"
       VCPKG_BASELINE_COMMIT: "4c1734ba2a969b1e6daa0ac79bc46ead7324df90"
-      VCPKG_CACHE_KEY: "refractive-colmap-vcpkg-win64-4c1734ba-deps-v2"
+      VCPKG_CACHE_KEY: "refractive-colmap-vcpkg-win64-4c1734ba-deps-v3"
 
     steps:
       - name: Checkout build harness
@@ -49,9 +49,6 @@ jobs:
             throw "GitHub Windows runner no longer provides MSYS2 at $bash"
           }
 
-          # The pinned 2023 vcpkg snapshot references MSYS2 package revisions
-          # that have since been removed from the mirrors. Install the current
-          # equivalents from the runner's maintained MSYS2 installation.
           & $bash -lc "pacman -Sy --needed --noconfirm mingw-w64-x86_64-pkgconf mingw-w64-x86_64-gcc-fortran"
           if ($LASTEXITCODE -ne 0) {
             throw "Could not install current MSYS2 MinGW pkgconf/gfortran."
@@ -63,7 +60,6 @@ jobs:
             if (-not (Test-Path $tool)) { throw "Expected MinGW tool is missing: $tool" }
           }
 
-          # Make native MinGW tools visible to vcpkg's CMake compiler discovery.
           $env:PATH = "$mingwBin;$env:PATH"
           $mingwBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           "PKG_CONFIG=$pkgConfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -73,8 +69,6 @@ jobs:
           & $gfortran --version | Select-Object -First 1
           if ($LASTEXITCODE -ne 0) { throw "Native MinGW gfortran failed its version check." }
 
-          # Prove pkg-config accepts the exact native Windows semicolon path
-          # convention used by vcpkg_fixup_pkgconfig.
           $probe1 = Join-Path $pwd "pkgconf_probe_empty"
           $probe2 = Join-Path $pwd "pkgconf_probe_hit"
           New-Item -ItemType Directory -Force $probe1, $probe2 | Out-Null
@@ -96,8 +90,6 @@ jobs:
             throw "Native MinGW pkg-config cannot resolve vcpkg-style Windows semicolon PKG_CONFIG_PATH."
           }
 
-          # Prove the current gfortran can compile, link, and execute a native
-          # x64 Windows program before vcpkg reaches LAPACK/SuiteSparse.
           $fortranSource = Join-Path $pwd "gfortran_probe.f90"
           $fortranExe = Join-Path $pwd "gfortran_probe.exe"
           @(
@@ -139,7 +131,7 @@ jobs:
           Set-Content -Path $path -Value $text -NoNewline
           Write-Host "Patched legacy find_package(Glew) to CMake/vcpkg-compatible find_package(GLEW)."
 
-      - name: Fetch upstream-pinned vcpkg baseline
+      - name: Fetch and repair upstream-pinned vcpkg baseline
         shell: pwsh
         run: |
           git init vcpkg
@@ -148,9 +140,9 @@ jobs:
           git -C vcpkg checkout --detach FETCH_HEAD
           git -C vcpkg rev-parse HEAD | Tee-Object -FilePath VCPKG_COMMIT.txt
 
-          # The historical helper downloads a removed 2023 MSYS2 pkgconf build.
-          # Keep the pinned package definitions but force it to use the current,
-          # already-preflighted native MinGW pkg-config executable instead.
+          # Repair only fossilized bootstrap-tool discovery. Package versions
+          # and scientific/runtime dependencies remain pinned to upstream's own
+          # historical Windows baseline.
           $pkgHelper = "vcpkg/scripts/cmake/vcpkg_find_acquire_program(PKGCONFIG).cmake"
           $pkgText = Get-Content $pkgHelper -Raw
           $pkgOld = "set(program_name pkg-config)`nif(DEFINED ENV{PKG_CONFIG})"
@@ -171,6 +163,37 @@ jobs:
           Set-Content -Path $pkgHelper -Value $pkgText -NoNewline
           Write-Host "Patched legacy vcpkg helper to use current native MinGW pkg-config."
 
+          # vcpkg also sanitizes PATH before vcpkg_find_fortran() runs, so the
+          # valid runner gfortran is invisible there. Short-circuit the helper
+          # to pass the already-preflighted absolute compiler path directly to
+          # LAPACK's CMake configure. Keep VCPKG_USE_INTERNAL_Fortran false so
+          # lapack-reference[noblas] retains its supported external-compiler path.
+          $fortranHelper = "vcpkg/scripts/cmake/vcpkg_find_fortran.cmake"
+          $fortranText = Get-Content $fortranHelper -Raw
+          $fortranOld = "    vcpkg_list(SET additional_cmake_args)`n`n    set(CMAKE_BINARY_DIR"
+          $fortranNewLines = @(
+            '    vcpkg_list(SET additional_cmake_args)',
+            '',
+            '    if(CMAKE_HOST_WIN32 AND EXISTS "C:/msys64/mingw64/bin/gfortran.exe")',
+            '        message(STATUS "Using preflighted runner-provided MinGW gfortran.")',
+            '        vcpkg_list(APPEND additional_cmake_args',
+            '            -DCMAKE_GNUtoMS=ON',
+            '            "-DCMAKE_Fortran_COMPILER=C:/msys64/mingw64/bin/gfortran.exe"',
+            '            "-DCMAKE_Fortran_FLAGS_INIT:STRING= -mabi=ms -m64 ${VCPKG_Fortran_FLAGS}")',
+            '        set("${out_var}" "${additional_cmake_args}" PARENT_SCOPE)',
+            '        return()',
+            '    endif()',
+            '',
+            '    set(CMAKE_BINARY_DIR'
+          )
+          $fortranNew = $fortranNewLines -join "`n"
+          if (-not $fortranText.Contains($fortranOld)) {
+            throw "Expected legacy Fortran helper prologue not found; refusing blind patch."
+          }
+          $fortranText = $fortranText.Replace($fortranOld, $fortranNew)
+          Set-Content -Path $fortranHelper -Value $fortranText -NoNewline
+          Write-Host "Patched legacy vcpkg Fortran discovery to use current runner gfortran directly."
+
           .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
 
       - name: Restore pinned dependency tree
@@ -179,6 +202,8 @@ jobs:
         with:
           path: vcpkg/installed
           key: ${{ env.VCPKG_CACHE_KEY }}
+          restore-keys: |
+            ${{ env.VCPKG_CACHE_KEY }}-partial-
 
       - name: Install pinned CPU headless dependencies
         shell: pwsh
@@ -206,8 +231,15 @@ jobs:
             --triplet x64-windows `
             --clean-after-build
 
-      - name: Save pinned dependency tree
-        if: steps.restore-vcpkg.outputs.cache-hit != 'true'
+      - name: Preserve partial dependency progress on failure
+        if: failure() && steps.restore-vcpkg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg/installed
+          key: ${{ env.VCPKG_CACHE_KEY }}-partial-${{ github.run_id }}
+
+      - name: Save complete pinned dependency tree
+        if: success() && steps.restore-vcpkg.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: vcpkg/installed
@@ -270,8 +302,6 @@ jobs:
           if (Test-Path vcpkg\installed\x64-windows\bin) {
             Copy-Item vcpkg\installed\x64-windows\bin\*.dll artifact\ -ErrorAction SilentlyContinue
           }
-          # LAPACK may have been built with the runner's external MinGW
-          # gfortran. Include its runtime DLLs if they are present.
           foreach ($dll in @('libgfortran-5.dll','libquadmath-0.dll','libwinpthread-1.dll','libgcc_s_seh-1.dll')) {
             $src = Join-Path 'C:\msys64\mingw64\bin' $dll
             if (Test-Path $src) { Copy-Item $src artifact\ }
